@@ -7,8 +7,14 @@
 
 
 #include <PID_AutoTune_v0.h> // the Autotuner
+// The t0mpr1c3 Autotune library currently does not seem to compile on recent Arduino IDE versions. Use this one instead:
+// https://github.com/jhagberg/Arduino-PID-AutoTune-Library
 
-#define DP 3 
+// #define DEBUG
+
+#define NC 4 
+
+#define DP 2 
 
 #ifdef CELSIUS // only affects startup conditions -- UNITS command determines runtime units
 boolean Cscale = true;
@@ -36,6 +42,10 @@ filterRC fT[NC]; // filter for logged ET, BT
 
 double Input, Output;
 
+uint32_t last_output = 0;
+uint32_t last_sample_time = 0;
+uint8_t last_sample_channel = 0;
+
 
 //mcEEPROM eeprom;
 //calBlock caldata;
@@ -46,6 +56,7 @@ float convertUnits ( float t ) {
   if ( Cscale ) return F_TO_C( t );
   else return t;
 }
+
 
 void get_samples() // this function talks to the amb sensor and ADC via I2C
 {
@@ -58,15 +69,22 @@ void get_samples() // this function talks to the amb sensor and ADC via I2C
   uint16_t dADC = adc.getConvTime();
   dly = dly > dADC ? dly : dADC;
 
-  for ( uint8_t jj = 0; jj < NC; jj++ ) { // one-shot conversions on both chips
-    uint8_t k = jj; // map logical channels to physical ADC channels
-    // jj = logical channel; k = physical channel
+  if ( millis() >= last_sample_time + dly){
+    last_sample_channel++;
+    int k = last_sample_channel;
+    last_sample_channel = last_sample_channel % NC;
+    #ifdef DEBUG
+    Serial.print("Reading ADC channel ");
+    Serial.println(k);
+    #endif
     if ( k > 0 ) {
       --k;
+      #ifdef DEBUG
+      Serial.print("Reading ADC channel ");
+      Serial.println(k);
+      #endif
       tc = tcp[k]; // each channel may have its own TC type
-      adc.nextConversion( k ); // start ADC conversion on physical channel k
-      amb.nextConversion(); // start ambient sensor conversion
-      delay( dly ); // give the chips time to perform the conversions
+//        delay( dly ); // give the chips time to perform the conversions
       amb.readSensor(); // retrieve value from ambient temp register
       v = adc.readuV(); // retrieve microvolt sample from MCP3424
       tempF = tc->Temp_F( 0.001 * v, amb.getAmbF() ); // convert uV to Celsius
@@ -75,14 +93,23 @@ void get_samples() // this function talks to the amb sensor and ADC via I2C
       v >>= 10;
       AT = amb.getAmbF();
       T[k] = tc->Temp_F( 0.001 * v, AT ); // convert uV to Fahrenheit;
+      last_sample_time = millis();
+      #ifdef DEBUG
+      Serial.print("Temperature is ");
+      Serial.println(convertUnits(tc->Temp_F( 0.001 * v, AT )));
+      #endif
+      adc.nextConversion( (k+1)%NC ); // start ADC conversion on physical channel k
+      amb.nextConversion(); // start ambient sensor conversion
     }
   }
-};
+}
+
+
 
 
 void do_tuning(float output_step, int control_type, float look_back, float noise_band) {
 
-  long lastSerialOutput = millis();
+  last_output = millis();
 
   boolean tuning = true;
   double kp, ki, kd;
@@ -110,7 +137,7 @@ void do_tuning(float output_step, int control_type, float look_back, float noise
     Input = convertUnits( T[pid_chan] );
 
     // output debug to serial
-    if (millis() > lastSerialOutput + 1000) {
+    if (millis() > last_output + 1000) {
 
       Serial.print("TUNING! Temperatures: ");
       Serial.print( convertUnits( AT ), DP );
@@ -127,12 +154,12 @@ void do_tuning(float output_step, int control_type, float look_back, float noise
       Serial.print(",");
       Serial.print( levelOT2 );
       Serial.print(",");
-      Serial.print( levelIO3);
-      Serial.println(",");
+      Serial.println( levelIO3);
+//      Serial.println(",");
 
-      status_string();
+      //status_string();
       
-      lastSerialOutput = millis();
+      last_output = millis();
     }
 
 
@@ -152,25 +179,35 @@ void do_tuning(float output_step, int control_type, float look_back, float noise
       Serial.print(ki, 8);
       Serial.print("; kd = ");
       Serial.println(kd, 8);
+      Serial.print("Tuning parameters were:  outputStep = ");
+      Serial.print(output_step);
+      Serial.print("; noiseBand = ");
+      Serial.print(noise_band);
+      Serial.print("; lookBack = ");
+      Serial.print(look_back);
+      Serial.print("; controlType = ");
+      Serial.println(control_type);
+//      levelOT1 = 0;
+//      ssr.Out( levelOT1, levelOT2 );
+      delay(5000);
     }
 
     levelOT1 = Output;
     ssr.Out( levelOT1, levelOT2 );
 
+    while ( Serial.available() ){
+      delay(1);
+      if (Serial.read() == 'x') {
+        tuning = false;
+        Serial.println("Received \'x\' key, tuning stopped.");
+        levelOT1 = 0;
+        ssr.Out( levelOT1, levelOT2 );
+      }
+    }
+
   }
 }
 
-String serial_to_string() {
-  String inData = "";
-  while (Serial.available() > 0)
-  {
-    char received = Serial.read();
-    inData += received;
-    if (received == '\n') break;
-
-  }
-  return inData;
-}
 
 void status_string() {
 
@@ -195,43 +232,101 @@ void status_string() {
 
 
 void check_serial() {
-  String command = serial_to_string();
-  if (command.startsWith("OT1") && command.substring(4).toFloat()) {
-      levelOT1 = command.substring(4).toInt();
-      ssr.Out( levelOT1, levelOT2 );
-      Serial.println("OK");
+
+  // Command parser
+  if ( Serial.available()){
+    char command[80];
+    char par1[80];
+    char par2[80];
+    char par3[80];
+    char par4[80];
+    int index = 0;
+    while ( Serial.available()){
+      char nextchar = Serial.read();
+      if(nextchar == '\n')
+      {
+        break;
+      }
+      else
+      {
+        command[index] = nextchar;
+        index++;
+        command[index] = '\0'; // Keep the string NULL terminated
+      }
+      delay(1);
+    }
+
+    char * tok, com;
+    com = strtok (command," ,;:");
+    
+    float params[5] = {0,0,0,0,0};
+    tok = strtok (NULL, " ,;:");
+    int i = 0;
+    while (tok != NULL && i < 5)
+    {
+      params[i] = atof(tok);
+      tok = strtok (NULL, " ,;:");
+
+      i++;
+    }
+
+      
+    // Do stuff
+    if ( (command[0] == 'o' || command[0] == 'O') && (command[1] == 't' || command[1] == 'T') && command[2] == '1' ){
+        levelOT1 = params[0];
+        ssr.Out( levelOT1, levelOT2 );
+        Serial.print("OK : OT1 set to "); Serial.println(params[0]);
+    }
+    else if ( (command[0] == 'o' || command[0] == 'O') && (command[1] == 't' || command[1] == 'T') && command[2] == '2' ) {
+        levelOT2 = params[0];
+        ssr.Out( levelOT1, levelOT2 );
+        Serial.print("OK : OT2 set to "); Serial.println(params[0]);
+    }
+    else if ( (command[0] == 'i' || command[0] == 'I') && (command[1] == 'o' || command[1] == 'O') && command[2] == '3' ) {
+        levelIO3 = params[0];
+        float pow = 2.55 * levelIO3;
+        analogWrite( IO3, round( pow ) );
+        Serial.print("OK : IO3 set to "); Serial.println(params[0]);
+    }
+    
+    else if ( (command[0] == 't' || command[0] == 'T') && (command[1] == 'u' || command[1] == 'U') && (command[2] == 'n' || command[2] == 'N') && (command[3] == 'e' || command[3] == 'E') ) {
+  
+        float output_step = params[0];
+        float noise_band = params[1];
+        float look_back = params[2];
+        int control_type = params[3];
+        Serial.print("OK : Start tuning with parameters: Output step = "); Serial.print(params[0]);
+        Serial.print(" Noise band = "); Serial.print(params[1]);
+        Serial.print(" Look back = "); Serial.print(params[2]);
+        Serial.print(" Tuning algorithm= "); Serial.println((int) params[3]);
+        do_tuning(output_step, control_type, look_back, noise_band);
+    }
+    else{
+        Serial.print("Sorry, I'm unable to parse that: ");
+        Serial.println(command);
+    }
   }
-  else if (command.startsWith("OT2") && command.substring(4).toFloat()) {
-      levelOT2 = command.substring(4).toInt();
-      ssr.Out( levelOT1, levelOT2 );
-      Serial.println("OK");
+
+  // Periodically write out current temperatures and heater/fan levels.
+  if ( millis() >= last_output + 1000){
+    last_output = millis();
+    status_string();
   }
-  else if (command.startsWith("IO3") && command.substring(4).toFloat()) {
-      levelIO3 = command.substring(4).toInt();
-      float pow = 2.55 * levelIO3;
-      analogWrite( IO3, round( pow ) );
-      Serial.println("OK");
-  }
-  else if (command.startsWith("TUNE ") && command.substring(5, 10).toFloat() && command.substring(11, 16).toFloat() && command.substring(17).toInt()) {
-      float output_step = command.substring(5, 10).toFloat();
-      float noise_band = command.substring(11, 16).toFloat();
-      float look_back = command.substring(17, 22).toFloat();
-      int control_type = command.substring(23).toInt();
-      do_tuning(output_step, control_type, look_back, noise_band);
-  }
-  else {
-      Serial.println("Sorry, I'm unable to parse that.");
-  }
-  status_string();
+
 }
 
+
+
+
+
 void setup() {
+  analogWrite( IO3, 0 ); // set fan off on startup
+  
   delay(100);
   Wire.begin();
   Serial.begin(BAUD);
 
 
-  analogWrite( IO3, 0 ); // set fan off on startup
   amb.init( AMB_FILTER );  // initialize ambient temp filtering
 
   adc.setCal( CAL_GAIN, UV_OFFSET );
@@ -259,5 +354,5 @@ void loop() {
   get_samples();
   check_serial();
   
-  delay(1000);
+  //delay(1000);
 }
